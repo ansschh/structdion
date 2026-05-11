@@ -18,6 +18,7 @@ import math
 import os
 from collections import defaultdict
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 
@@ -56,26 +57,33 @@ def _paired_bootstrap_ci(deltas: list, n_resamples: int = 10000, alpha: float = 
 
 
 def _aggregate(runs):
-    by_profile = defaultdict(list)
+    """Group runs by (scale, profile). Older results without an explicit
+    'scale' field are bucketed under '340m' since the original launcher
+    only supported 320M."""
+    nested: dict = defaultdict(lambda: defaultdict(list))
     for r in runs:
         p = r['result'].get('profile')
         if p is None:
             continue
-        by_profile[p].append(r)
-    return by_profile
+        scale = r['result'].get('scale', '340m')
+        nested[scale][p].append(r)
+    return nested
 
 
-def table_main(by_profile, out_path: Path):
-    """Headline matched-communication validation-loss table."""
-    profiles = ['uniform_comm', 'struct', 'inverted']
+PROFILE_ORDER = ['adamw', 'muon', 'uniform_comm', 'struct',
+                 'inverted_matched', 'inverted']
+
+
+def _scale_table(scale: str, by_profile: dict) -> Tuple[list, dict]:
+    """Build per-profile summary rows and paired-delta stats for one scale."""
     rows = []
-    for profile in profiles:
+    for profile in PROFILE_ORDER:
         items = by_profile.get(profile, [])
         if not items:
             continue
         losses = [r['result']['final_val_loss'] for r in items]
         seeds = sorted(int(r['result']['seed']) for r in items)
-        b_ratio = items[0]['result']['budget_ratio_vs_struct']
+        b_ratio = items[0]['result'].get('budget_ratio_vs_struct', float('nan'))
         rows.append({
             'profile': profile,
             'n_seeds': len(losses),
@@ -86,57 +94,84 @@ def table_main(by_profile, out_path: Path):
             'budget_ratio': b_ratio,
         })
 
-    # Paired deltas vs uniform_comm
-    delta_struct_vs_uniform = []
-    delta_inverted_vs_uniform = []
     uniform_by_seed = {r['result']['seed']: r['result']['final_val_loss']
                        for r in by_profile.get('uniform_comm', [])}
-    struct_by_seed = {r['result']['seed']: r['result']['final_val_loss']
-                      for r in by_profile.get('struct', [])}
-    inverted_by_seed = {r['result']['seed']: r['result']['final_val_loss']
-                        for r in by_profile.get('inverted', [])}
-    for seed, u_loss in uniform_by_seed.items():
-        if seed in struct_by_seed:
-            delta_struct_vs_uniform.append(struct_by_seed[seed] - u_loss)
-        if seed in inverted_by_seed:
-            delta_inverted_vs_uniform.append(inverted_by_seed[seed] - u_loss)
 
-    mean_s, lo_s, hi_s = _paired_bootstrap_ci(delta_struct_vs_uniform)
-    mean_i, lo_i, hi_i = _paired_bootstrap_ci(delta_inverted_vs_uniform)
+    def paired(other_profile: str) -> dict:
+        other = {r['result']['seed']: r['result']['final_val_loss']
+                 for r in by_profile.get(other_profile, [])}
+        deltas = [other[s] - uniform_by_seed[s]
+                  for s in uniform_by_seed if s in other]
+        m, lo, hi = _paired_bootstrap_ci(deltas)
+        return {'profile': other_profile, 'mean': m, 'ci_lo': lo, 'ci_hi': hi,
+                'n': len(deltas), 'values': deltas}
 
+    paired_stats = {
+        p: paired(p) for p in ('struct', 'inverted_matched', 'inverted',
+                               'adamw', 'muon')
+        if by_profile.get(p)
+    }
+    return rows, paired_stats
+
+
+def table_main(by_scale: dict, out_path: Path):
     text = []
     text.append('Structural law: matched-communication validation loss')
-    text.append('=' * 60)
-    text.append(f'{"profile":15s} {"n":>3s} {"mean":>8s} {"std":>8s} '
-                f'{"B/B*":>6s} {"losses":<30s}')
-    for row in rows:
-        text.append(f'{row["profile"]:15s} {row["n_seeds"]:>3d} '
-                    f'{row["mean"]:8.4f} {row["std"]:8.4f} '
-                    f'{row["budget_ratio"]:6.3f} {row["losses"]}')
-    text.append('')
-    text.append('Paired deltas (vs uniform_comm at matched seed):')
-    text.append(f'  struct   - uniform :  mean={mean_s:+.4f} '
-                f'  95%CI=[{lo_s:+.4f}, {hi_s:+.4f}]  n={len(delta_struct_vs_uniform)}')
-    text.append(f'  inverted - uniform :  mean={mean_i:+.4f} '
-                f'  95%CI=[{lo_i:+.4f}, {hi_i:+.4f}]  n={len(delta_inverted_vs_uniform)}')
+    text.append('=' * 76)
+    summary = {}
+    for scale in sorted(by_scale.keys()):
+        by_profile = by_scale[scale]
+        rows, paired_stats = _scale_table(scale, by_profile)
+        text.append('')
+        text.append(f'>>> scale = {scale} <<<')
+        text.append(f'{"profile":18s} {"n":>3s} {"mean":>8s} {"std":>8s} '
+                    f'{"B/B*":>6s} {"losses":<30s}')
+        for row in rows:
+            text.append(f'{row["profile"]:18s} {row["n_seeds"]:>3d} '
+                        f'{row["mean"]:8.4f} {row["std"]:8.4f} '
+                        f'{row["budget_ratio"]:6.3f} {row["losses"]}')
+        if paired_stats:
+            text.append('  paired deltas vs uniform_comm:')
+            for prof, st in paired_stats.items():
+                text.append(f'    {prof:18s} mean={st["mean"]:+.4f} '
+                            f'95%CI=[{st["ci_lo"]:+.4f}, {st["ci_hi"]:+.4f}] '
+                            f'n={st["n"]}')
+        summary[scale] = {'rows': rows, 'paired': paired_stats}
     text.append('')
     text.append('Interpretation:')
-    text.append('  struct - uniform should be NEGATIVE (struct wins). ')
-    text.append('  inverted - uniform should be POSITIVE if inverted is a true falsifier.')
-    text.append('  If inverted has B/B* != 1.0, the comparison is NOT matched-comm.')
+    text.append('  struct - uniform should be NEGATIVE (struct wins at matched comm).')
+    text.append('  inverted_matched - uniform should be POSITIVE if the rule is real.')
+    text.append('  adamw and muon are external full-rank anchors (not matched comm).')
 
     out_path.write_text('\n'.join(text), encoding='utf-8')
     print(f'wrote {out_path}')
-    return {
-        'rows': rows,
-        'delta_struct_vs_uniform': {'mean': mean_s, 'ci_lo': lo_s, 'ci_hi': hi_s,
-                                    'values': delta_struct_vs_uniform},
-        'delta_inverted_vs_uniform': {'mean': mean_i, 'ci_lo': lo_i, 'ci_hi': hi_i,
-                                      'values': delta_inverted_vs_uniform},
-    }
+    return summary
 
 
-def fig_capture(by_profile, out_dir: Path):
+def fig_capture_per_scale(by_scale: dict, out_dir: Path):
+    """One capture figure per scale (struct runs only)."""
+    paths = {}
+    for scale in sorted(by_scale.keys()):
+        sub = out_dir / scale
+        sub.mkdir(parents=True, exist_ok=True)
+        p = fig_capture(by_scale[scale], sub, scale=scale)
+        if p:
+            paths[scale] = p
+    return paths
+
+
+def fig_trajectory_per_scale(by_scale: dict, out_dir: Path):
+    paths = {}
+    for scale in sorted(by_scale.keys()):
+        sub = out_dir / scale
+        sub.mkdir(parents=True, exist_ok=True)
+        p = fig_trajectory(by_scale[scale], sub, scale=scale)
+        if p:
+            paths[scale] = p
+    return paths
+
+
+def fig_capture(by_profile, out_dir: Path, scale: str = ""):
     """Figure: Ky-Fan and Frobenius per-role marginal capture curves
     averaged over seeds of the STRUCT profile at the latest captured step.
     These are the Theorem 1 diagnostic curves."""
@@ -209,7 +244,7 @@ def fig_capture(by_profile, out_dir: Path):
     return str(p_pdf)
 
 
-def fig_trajectory(by_profile, out_dir: Path):
+def fig_trajectory(by_profile, out_dir: Path, scale: str = ""):
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -218,8 +253,11 @@ def fig_trajectory(by_profile, out_dir: Path):
         print(f'matplotlib unavailable: {e}; skipping trajectory figure')
         return None
 
-    profile_colors = {'uniform_comm': '#888888', 'struct': '#1f77b4',
-                      'inverted': '#d62728'}
+    profile_colors = {
+        'adamw': '#9467bd', 'muon': '#ff7f0e',
+        'uniform_comm': '#888888', 'struct': '#1f77b4',
+        'inverted_matched': '#d62728', 'inverted': '#e377c2',
+    }
     fig, ax = plt.subplots(1, 1, figsize=(7, 4.0))
     for profile, runs in by_profile.items():
         steps_by_seed = []
@@ -278,19 +316,20 @@ def main():
     if not runs:
         print(f'no runs found in {root}')
         return
-    by_profile = _aggregate(runs)
-    summary = table_main(by_profile, root / 'table_main.txt')
-    capture_path = fig_capture(by_profile, root)
-    traj_path = fig_trajectory(by_profile, root)
+    by_scale = _aggregate(runs)
+    summary = table_main(by_scale, root / 'table_main.txt')
+    capture_paths = fig_capture_per_scale(by_scale, root / 'figs')
+    traj_paths = fig_trajectory_per_scale(by_scale, root / 'figs')
 
     out = {
         'n_runs': len(runs),
-        'profiles': {p: len(runs) for p, runs in by_profile.items()},
+        'scales': {scale: {p: len(rs) for p, rs in by_p.items()}
+                   for scale, by_p in by_scale.items()},
         'summary': summary,
-        'fig_capture': capture_path,
-        'fig_trajectory': traj_path,
+        'fig_capture': capture_paths,
+        'fig_trajectory': traj_paths,
     }
-    json.dump(out, open(root / 'summary.json', 'w'), indent=2)
+    json.dump(out, open(root / 'summary.json', 'w'), indent=2, default=str)
     print(f'wrote {root / "summary.json"}')
 
 
