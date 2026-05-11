@@ -1,49 +1,63 @@
 #!/usr/bin/env python
 """
-Structural rank allocation experiment runner for LLaMA320M.
+Structural rank-allocation training launcher.
 
+Supports three scales and five optimizers, with FSDP for multi-GPU.
 Profiles:
-  struct        r_FFN = d,    r_qko = 4 * d_h,    r_v = d_h
-  uniform_comm  r_l = R for every matrix layer, with R chosen so that
-                B(uniform_R) = B(struct) (matched per-step communication)
-  inverted      r_FFN = d_h,  r_qko = d/4,        r_v = d
-                (natural budget, NOT matched to struct; reported as ratio)
+  struct            r_FFN=d,    r_qko=4*d_h,    r_v=d_h
+  uniform_comm      r_l = R for every matrix layer, R chosen so
+                    B(uniform_R) per layer equals B(struct) per layer
+  inverted_matched  cyclic-shifted role assignment, FFN-bumped to match B*
+  adamw             non-spectral baseline (AdamW on every parameter)
+  muon              full-rank spectral baseline (Newton-Schulz orthogonalisation
+                    on matrix params, AdamW on scalars)
 
-Per-role rank is achieved by routing matrix parameters into three
-separate AdaDion optimizers (qko, v, ffn) each with adaptive_rank=False
-and a fixed init_rank_fraction. Scalars and embeddings ride on AdamW.
+Scales: 340m, 700m, 1b (see models.py).
 
-We log Ky-Fan and Frobenius capture spectra at fixed intervals via
-batch SVD of the per-parameter gradient signal.
+Launch single-GPU:
+  python structural_law_entry.py --profile struct --scale 340m --seed 0
 
-Run e.g.
-  python structural_law_entry.py --profile struct --seed 0 --steps 5000
+Launch multi-GPU via torchrun (FSDP):
+  torchrun --nproc_per_node=4 structural_law_entry.py \
+      --profile struct --scale 1b --seed 0
+
+Spectral-capture and qbuf logging are always on.
 """
+from __future__ import annotations
+
 import argparse
 import json
 import math
 import os
+import sys
 import time
+from typing import Dict, List, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch import Tensor
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-import dion.dion as dd  # noqa: F401  (kept in case other patches are needed later)
+import dion.dion as dd  # noqa: F401
 
 from torchtitan.experiments.ortho_matrix.ada_dion.adadion import AdaDion
 
-# LLaMA320M, get_c4_dataloader, get_lr, evaluate live in the sibling
-# train_320m.py inside this directory (not in the installed torchtitan
-# package). Add the script directory to sys.path so we can import it.
-import os as _os
-import sys as _sys
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
-if _HERE not in _sys.path:
-    _sys.path.insert(0, _HERE)
-from train_320m import (  # noqa: E402
-    LLaMA320M, get_c4_dataloader, get_lr, evaluate,
-)
+# Make sibling imports work.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from models import build_model, scale_dims, Block, SCALE_SPECS  # noqa: E402
+from train_320m import get_c4_dataloader, get_lr, evaluate  # noqa: E402
+
+# Optional Muon import (only needed if --profile muon).
+try:
+    from dion import Muon
+except Exception:  # pragma: no cover - exercised only at --profile muon time
+    Muon = None  # type: ignore
 
 
 # =============================================================================
@@ -51,67 +65,75 @@ from train_320m import (  # noqa: E402
 # =============================================================================
 
 def classify(name: str) -> str:
-    """Map a parameter name to one of qko, v, ffn, embed, other."""
     n = name.lower()
-    if any(tag in n for tag in ('attn.wq', 'attn.wk', 'attn.wo',
-                                'q_proj', 'k_proj', 'o_proj')):
-        return 'qko'
-    if 'attn.wv' in n or 'v_proj' in n:
-        return 'v'
-    if any(tag in n for tag in ('ffn.w1', 'ffn.w2', 'ffn.w3',
-                                'feed_forward', 'mlp', 'gate_proj',
-                                'up_proj', 'down_proj')):
-        return 'ffn'
-    if 'tok_emb' in n or 'lm_head' in n or 'embed' in n:
-        return 'embed'
-    return 'other'
+    if any(tag in n for tag in ("attn.wq", "attn.wk", "attn.wo")):
+        return "qko"
+    if "attn.wv" in n:
+        return "v"
+    if any(tag in n for tag in ("ffn.w1", "ffn.w2", "ffn.w3")):
+        return "ffn"
+    if "tok_emb" in n or "lm_head" in n or "embed" in n:
+        return "embed"
+    return "other"
 
 
 # =============================================================================
-# Budget arithmetic
+# Budget arithmetic and profile resolution
 # =============================================================================
 
 def per_layer_budget(r: dict, d: int, ffn_hidden: int) -> int:
-    """Communication cost per transformer layer for rank dict
-    r = {'ffn', 'qko', 'v'}, in units of rank * (m + n)."""
-    a_attn = d + d            # attn matrices are d x d
-    a_ffn = ffn_hidden + d    # ffn matrices are hidden x d (and d x hidden)
-    return 3 * r['qko'] * a_attn + r['v'] * a_attn + 3 * r['ffn'] * a_ffn
+    a_attn = 2 * d
+    a_ffn = ffn_hidden + d
+    return 3 * r["qko"] * a_attn + r["v"] * a_attn + 3 * r["ffn"] * a_ffn
 
 
 def uniform_matched_rank(d: int, d_h: int, ffn_hidden: int) -> int:
-    """Uniform rank R such that B(uniform_R) per layer equals
-    B(struct) per layer."""
-    struct = {'ffn': d, 'qko': 4 * d_h, 'v': d_h}
+    struct = {"ffn": d, "qko": 4 * d_h, "v": d_h}
     b_struct = per_layer_budget(struct, d, ffn_hidden)
-    # B(uniform_R) per layer = R * (4 * a_attn + 3 * a_ffn)
-    per_rank = 4 * (d + d) + 3 * (ffn_hidden + d)
+    per_rank = 4 * (2 * d) + 3 * (ffn_hidden + d)
     return round(b_struct / per_rank)
 
 
+def inverted_matched_ranks(d: int, d_h: int, ffn_hidden: int, max_rank: int) -> dict:
+    """Cyclic-shift the role-to-rank assignment, then bump FFN so the
+    total budget equals B(struct). Concretely: start from (qko=d_h, v=d,
+    FFN=4*d_h), cap v at max_rank, and add rank to FFN until B matches."""
+    base_qko = d_h
+    base_v = min(d, max_rank)
+    base_ffn = 4 * d_h
+    a_attn = 2 * d
+    a_ffn = ffn_hidden + d
+    b_base = 3 * base_qko * a_attn + base_v * a_attn + 3 * base_ffn * a_ffn
+    b_struct = per_layer_budget({"ffn": d, "qko": 4 * d_h, "v": d_h}, d, ffn_hidden)
+    gap = max(b_struct - b_base, 0)
+    extra_ffn = gap // (3 * a_ffn)
+    ffn = min(base_ffn + int(extra_ffn), max_rank)
+    return {"qko": base_qko, "v": base_v, "ffn": ffn}
+
+
 def resolve_profile(name: str, d: int, d_h: int, ffn_hidden: int, max_rank: int) -> dict:
-    if name == 'struct':
-        ranks = {'ffn': d, 'qko': 4 * d_h, 'v': d_h}
-    elif name == 'uniform_comm':
+    if name == "struct":
+        ranks = {"ffn": d, "qko": 4 * d_h, "v": d_h}
+    elif name == "uniform_comm":
         R = uniform_matched_rank(d, d_h, ffn_hidden)
-        ranks = {'ffn': R, 'qko': R, 'v': R}
-    elif name == 'inverted':
-        ranks = {'ffn': d_h, 'qko': max(d // 4, 1), 'v': d}
+        ranks = {"ffn": R, "qko": R, "v": R}
+    elif name == "inverted_matched":
+        return inverted_matched_ranks(d, d_h, ffn_hidden, max_rank)
+    elif name in ("adamw", "muon"):
+        # No rank assignment; matrix optimizer handles all params at full rank.
+        return {"ffn": max_rank, "qko": max_rank, "v": max_rank}
     else:
-        raise ValueError(f'unknown profile {name}')
-    # Cap each role's rank at max_rank (= min(m, n) for the role's largest matrix)
+        raise ValueError(f"unknown profile {name}")
     return {k: min(v, max_rank) for k, v in ranks.items()}
 
 
 # =============================================================================
-# Capture spectra logging
+# Spectral capture logging
 # =============================================================================
 
 @torch.no_grad()
 def _accumulate_grads(model, dl_iter, n_batches: int, device: str):
-    """Run n_batches forward-backward passes, accumulating gradients."""
     model.zero_grad()
-    total_loss = 0.0
     seen = 0
     for _ in range(n_batches):
         try:
@@ -119,23 +141,18 @@ def _accumulate_grads(model, dl_iter, n_batches: int, device: str):
         except StopIteration:
             break
         x, y = x.to(device), y.to(device)
-        # Re-enable grad inside this no_grad scope for backward
         with torch.enable_grad():
             logits = model(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
             loss.backward()
-        total_loss += float(loss.item())
         seen += 1
-    return (total_loss / seen) if seen else float('nan')
 
 
 def log_capture(model, role_params: dict, dl, n_batches: int, device: str, step: int) -> dict:
-    """Compute per-parameter SVD of the gradient on a fresh n_batches mini-batch
-    and record both Ky-Fan partial sums and Frobenius partial sums per role."""
     dl_iter = iter(dl)
     _accumulate_grads(model, dl_iter, n_batches, device)
-    record = {'step': step, 'roles': {}}
-    for role in ('qko', 'v', 'ffn'):
+    record = {"step": step, "roles": {}}
+    for role in ("qko", "v", "ffn"):
         per_param = []
         for name, p in role_params[role]:
             if p.grad is None:
@@ -147,59 +164,157 @@ def log_capture(model, role_params: dict, dl, n_batches: int, device: str, step:
                 continue
             s_cpu = s.cpu()
             per_param.append({
-                'name': name,
-                'shape': list(G.shape),
-                'sigma': s_cpu.tolist(),
-                'cumsum_kf': s_cpu.cumsum(0).tolist(),
-                'cumsum_f': (s_cpu ** 2).cumsum(0).tolist(),
+                "name": name,
+                "shape": list(G.shape),
+                "sigma": s_cpu.tolist(),
+                "cumsum_kf": s_cpu.cumsum(0).tolist(),
+                "cumsum_f": (s_cpu ** 2).cumsum(0).tolist(),
             })
-        record['roles'][role] = per_param
+        record["roles"][role] = per_param
     model.zero_grad()
     return record
 
 
 # =============================================================================
-# qbuf verification (effective rank vs requested)
+# qbuf verification
 # =============================================================================
 
-def verify_qbuf(optimizers: list, requested_rank: dict, role_by_optid: dict) -> dict:
-    """Read each optimizer's internal Q buffers and confirm that the
-    deployed rank matches the requested rank for the param's role.
-    Returns mismatches."""
-    out = {'mismatches': [], 'ok': []}
+def verify_qbuf(optimizers: list, requested_rank: dict) -> dict:
+    out = {"mismatches": [], "ok": []}
     for opt in optimizers:
         if not isinstance(opt, AdaDion):
             continue
         for group in opt.param_groups:
-            if group.get('algorithm') == 'adamw':
+            if group.get("algorithm") == "adamw":
                 continue
-            role = group.get('role', None)
+            role = group.get("role")
             req = requested_rank.get(role) if role else None
-            for p in group['params']:
+            for p in group["params"]:
                 state = opt.state.get(p, {})
-                # Bundled AdaDion stores the orthonormal buffer as 'Qbuf' and
-                # the current rank as 'r'. State is populated only after the
-                # first step, so the pre-train check may find nothing (which
-                # is fine: we just have zero rows in the "ok" list).
-                Qbuf = state.get('Qbuf', None)
+                Qbuf = state.get("Qbuf")
                 if Qbuf is None:
                     continue
-                q_rank = state.get('r', None)
+                q_rank = state.get("r")
                 if q_rank is None and isinstance(Qbuf, Tensor):
                     q_rank = Qbuf.shape[-1]
                 rec = {
-                    'role': role,
-                    'requested': req,
-                    'deployed': int(q_rank) if q_rank is not None else None,
-                    'qbuf_shape': list(Qbuf.shape) if isinstance(Qbuf, Tensor) else None,
+                    "role": role, "requested": req,
+                    "deployed": int(q_rank) if q_rank is not None else None,
+                    "qbuf_shape": list(Qbuf.shape) if isinstance(Qbuf, Tensor) else None,
                 }
-                if rec['deployed'] is None or req is None:
+                if rec["deployed"] is None or req is None:
                     continue
-                if rec['deployed'] != req:
-                    out['mismatches'].append(rec)
+                if rec["deployed"] != req:
+                    out["mismatches"].append(rec)
                 else:
-                    out['ok'].append(rec)
+                    out["ok"].append(rec)
     return out
+
+
+# =============================================================================
+# Optimizer construction
+# =============================================================================
+
+def build_adadion_groups(
+    role_params: dict, target: dict, lr: float, max_rank: int
+) -> Tuple[list, List[Tensor]]:
+    """Return (param_groups, scalar_params)."""
+    param_groups = []
+    for role in ("qko", "v", "ffn"):
+        if not role_params[role]:
+            continue
+        params = [p for _, p in role_params[role]]
+        r = target[role]
+        param_groups.append({
+            "params": params, "role": role,
+            "init_rank": r, "rank_min": r, "rank_max": r,
+            "rank_step_up": 0, "rank_step_down": 0,
+        })
+
+    scalar_params = []
+    seen = set()
+    for role in ("embed", "other"):
+        for _, p in role_params[role]:
+            if id(p) not in seen:
+                scalar_params.append(p)
+                seen.add(id(p))
+
+    if scalar_params:
+        param_groups.append({
+            "params": scalar_params, "algorithm": "adamw",
+            "lr": 0.012, "weight_decay": 0.1,
+            "betas": (0.95, 0.95), "eps": 1e-8,
+        })
+
+    return param_groups, scalar_params
+
+
+def build_optimizers(
+    profile: str, role_params: dict, target: dict, lr: float, max_rank: int,
+    mesh=None,
+) -> List[torch.optim.Optimizer]:
+    if profile == "adamw":
+        all_matrix = []
+        for role in ("qko", "v", "ffn"):
+            all_matrix.extend(p for _, p in role_params[role])
+        scalars = []
+        for role in ("embed", "other"):
+            scalars.extend(p for _, p in role_params[role])
+        params = [p for p in all_matrix + scalars]
+        seen, dedup = set(), []
+        for p in params:
+            if id(p) not in seen:
+                dedup.append(p); seen.add(id(p))
+        return [torch.optim.AdamW(
+            dedup, lr=lr, weight_decay=0.1, betas=(0.9, 0.95), eps=1e-8,
+        )]
+
+    if profile == "muon":
+        if Muon is None:
+            raise RuntimeError("dion.Muon not importable; cannot use --profile muon")
+        all_matrix = [p for role in ("qko", "v", "ffn") for _, p in role_params[role]]
+        scalars = []
+        seen = set()
+        for role in ("embed", "other"):
+            for _, p in role_params[role]:
+                if id(p) not in seen:
+                    scalars.append(p); seen.add(id(p))
+        groups = [{"params": all_matrix}]
+        if scalars:
+            groups.append({"params": scalars, "algorithm": "adamw", "lr": 0.012})
+        return [Muon(groups, lr=lr, flatten=True)]
+
+    # Spectral profiles (struct, uniform_comm, inverted_matched): use AdaDion.
+    param_groups, _ = build_adadion_groups(role_params, target, lr, max_rank)
+    opt = AdaDion(
+        param_groups,
+        lr=lr,
+        weight_decay=0.1,
+        init_rank=target.get("qko", 64),
+        rank_min=16,
+        rank_max=max_rank,
+        device_mesh=mesh,
+    )
+    return [opt]
+
+
+# =============================================================================
+# Distributed setup
+# =============================================================================
+
+def setup_distributed():
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 # =============================================================================
@@ -208,118 +323,112 @@ def verify_qbuf(optimizers: list, requested_rank: dict, role_by_optid: dict) -> 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--profile', required=True,
-                    choices=['struct', 'uniform_comm', 'inverted'])
-    ap.add_argument('--steps', type=int, default=5000)
-    ap.add_argument('--batch_size', type=int, default=4)
-    ap.add_argument('--seq_len', type=int, default=1024)
-    ap.add_argument('--lr', type=float, default=0.012)
-    ap.add_argument('--seed', type=int, default=42)
-    ap.add_argument('--output_dir', default='results/struct_law')
-    ap.add_argument('--log_spectra_every', type=int, default=500)
-    ap.add_argument('--spectra_batches', type=int, default=4)
-    ap.add_argument('--eval_every', type=int, default=500)
-    ap.add_argument('--warmup', type=int, default=610)
+    ap.add_argument("--profile", required=True,
+                    choices=["struct", "uniform_comm", "inverted_matched", "adamw", "muon"])
+    ap.add_argument("--scale", default="340m", choices=list(SCALE_SPECS.keys()))
+    ap.add_argument("--steps", type=int, default=None,
+                    help="if unset, use T/P schedule: 340M=830000, 700M=1300000, 1B=750000")
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--seq_len", type=int, default=1024)
+    ap.add_argument("--lr", type=float, default=0.012)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--output_dir", default="results/struct_law")
+    ap.add_argument("--log_spectra_every", type=int, default=2000)
+    ap.add_argument("--spectra_batches", type=int, default=4)
+    ap.add_argument("--eval_every", type=int, default=1000)
+    ap.add_argument("--warmup", type=int, default=610)
     args = ap.parse_args()
 
+    rank, world_size, local_rank = setup_distributed()
+    is_main = rank == 0
+    device = f"cuda:{local_rank}" if world_size > 1 else "cuda"
+
     torch.manual_seed(args.seed)
-    device = 'cuda'
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
 
-    model = LLaMA320M(max_seq=args.seq_len).to(device)
-    d = 768
-    d_h = 64
-    ffn_hidden = 2048
-    max_rank = min(d, ffn_hidden)  # 768
+    # Default T/P=10 step counts at batch_size=4, seq_len=1024:
+    #   340M: 3.4B tokens = 830,000 steps
+    #   700M: 7.0B tokens = 1,700,000 steps  (T/P=10, but ~30h single-GPU H200)
+    #   1B:  10.0B tokens = 2,440,000 steps
+    # To fit a 2-day wall on the cluster we cut T/P for the bigger scales:
+    #   340M: T/P=10 (3.4B tokens), 830k steps
+    #   700M: T/P=5  (3.5B tokens), 860k steps
+    #   1B:   T/P=3  (3B tokens),   730k steps
+    DEFAULT_STEPS = {"340m": 830000, "700m": 860000, "1b": 730000}
+    if args.steps is None:
+        args.steps = DEFAULT_STEPS[args.scale]
 
+    if is_main:
+        print(f"[dist] rank={rank} world={world_size} local_rank={local_rank} device={device}")
+        print(f"[scale {args.scale}] steps={args.steps}")
+
+    # Build model
+    model = build_model(args.scale, max_seq=args.seq_len)
+    d, d_h, ffn_hidden, n_layers = scale_dims(args.scale)
+    max_rank = min(d, ffn_hidden)
+    model = model.to(device)
+
+    n_params = sum(p.numel() for p in set(model.parameters()))
+    if is_main:
+        print(f"[arch] d={d} d_h={d_h} ffn_hidden={ffn_hidden} L={n_layers} "
+              f"max_rank={max_rank} params={n_params/1e6:.1f}M")
+
+    # FSDP wrap if distributed
+    mesh = None
+    if world_size > 1:
+        from torch.distributed.device_mesh import init_device_mesh
+        mesh = init_device_mesh("cuda", (world_size,))
+        wrap_policy = lambda m, recurse, **kw: isinstance(m, Block) if not recurse else True
+        model = FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+            ),
+            auto_wrap_policy=wrap_policy,
+            device_id=local_rank,
+        )
+
+    # Resolve profile
     target = resolve_profile(args.profile, d, d_h, ffn_hidden, max_rank)
     b_actual = per_layer_budget(target, d, ffn_hidden)
-    b_struct = per_layer_budget({'ffn': d, 'qko': 4 * d_h, 'v': d_h}, d, ffn_hidden)
-    print(f'[arch] d={d}, d_h={d_h}, ffn_hidden={ffn_hidden}, max_rank={max_rank}')
-    print(f'[profile {args.profile}] target ranks: {target}')
-    print(f'[profile {args.profile}] per-layer B = {b_actual} '
-          f'(B/B_struct = {b_actual / b_struct:.3f})')
+    b_struct = per_layer_budget({"ffn": d, "qko": 4 * d_h, "v": d_h}, d, ffn_hidden)
+    if is_main:
+        print(f"[profile {args.profile}] ranks={target}  "
+              f"B/B_struct={b_actual / b_struct:.3f}")
 
-    # Classify parameters
-    role_params = {'qko': [], 'v': [], 'ffn': [], 'embed': [], 'other': []}
+    # Classify params
+    role_params = {"qko": [], "v": [], "ffn": [], "embed": [], "other": []}
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         role = classify(name)
-        # Only 2D params go to matrix optimizers
-        if role in ('qko', 'v', 'ffn') and p.ndim != 2:
-            role = 'other'
+        if role in ("qko", "v", "ffn") and p.ndim != 2:
+            role = "other"
         role_params[role].append((name, p))
+    if is_main:
+        for role in ("qko", "v", "ffn", "embed", "other"):
+            print(f"[role {role:6s}] {len(role_params[role])} params")
 
-    for role in ('qko', 'v', 'ffn', 'embed', 'other'):
-        print(f'[role {role:6s}] {len(role_params[role])} params')
-
-    # Build ONE AdaDion with per-role param-groups. The bundled AdaDion reads
-    # `init_rank`, `rank_min`, `rank_max` from each group; setting them all to
-    # the same target value locks the rank.
-    param_groups = []
-    role_by_group_idx = {}
-    for role in ('qko', 'v', 'ffn'):
-        if not role_params[role]:
-            continue
-        params = [p for _, p in role_params[role]]
-        target_rank = target[role]
-        param_groups.append({
-            'params': params,
-            'role': role,
-            'init_rank': target_rank,
-            'rank_min': target_rank,
-            'rank_max': target_rank,
-            'rank_step_up': 0,
-            'rank_step_down': 0,
-        })
-        role_by_group_idx[len(param_groups) - 1] = role
-        print(f'[group {role:4s}] target_rank={target_rank} '
-              f'(n_params={len(params)})')
-
-    # AdamW group for scalars and embeddings
-    scalar_params = []
-    seen = set()
-    for role in ('embed', 'other'):
-        for _, p in role_params[role]:
-            if id(p) not in seen:
-                scalar_params.append(p)
-                seen.add(id(p))
-    if scalar_params:
-        param_groups.append({
-            'params': scalar_params,
-            'algorithm': 'adamw',
-            'lr': 0.012,
-            'weight_decay': 0.1,
-            'betas': (0.95, 0.95),
-            'eps': 1e-8,
-        })
-        print(f'[group adam] n_params={len(scalar_params)}')
-
-    opt = AdaDion(
-        param_groups,
-        lr=args.lr,
-        weight_decay=0.1,
-        # bundled AdaDion takes integer init_rank as a global default; the
-        # per-group values above override this for each role group.
-        init_rank=target['qko'],
-        rank_min=16,
-        rank_max=max_rank,
+    optimizers = build_optimizers(
+        args.profile, role_params, target, args.lr, max_rank, mesh=mesh,
     )
-    optimizers = [opt]
-    role_by_optid = {id(opt): 'multi-group'}
+    if is_main:
+        print(f"[opt] {[type(o).__name__ for o in optimizers]}")
 
     # Data
     dl = get_c4_dataloader(batch_size=args.batch_size, seq_len=args.seq_len)
     train_iter = iter(dl)
 
-    # Logging buffers
-    step_log = []
-    val_log = []
-    capture_log = []
+    step_log: List[dict] = []
+    val_log: List[dict] = []
+    capture_log: List[dict] = []
 
-    # Pre-train spectral capture and qbuf verification
-    qbuf_pre = verify_qbuf(optimizers, target, role_by_optid)
-    print(f'[qbuf_pre] ok={len(qbuf_pre["ok"])} mismatches={len(qbuf_pre["mismatches"])}')
+    qbuf_pre = verify_qbuf(optimizers, target)
+    if is_main:
+        print(f"[qbuf_pre] ok={len(qbuf_pre['ok'])} mismatches={len(qbuf_pre['mismatches'])}")
 
     start = time.time()
     for step in range(args.steps):
@@ -333,7 +442,7 @@ def main():
         lr_now = get_lr(step, args.steps, args.lr, warmup=args.warmup)
         for opt in optimizers:
             for g in opt.param_groups:
-                g['lr'] = lr_now
+                g["lr"] = lr_now
 
         logits = model(x)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
@@ -343,72 +452,69 @@ def main():
             opt.step()
             opt.zero_grad(set_to_none=True)
 
-        step_log.append({'step': step, 'loss': float(loss.item()), 'lr': lr_now})
+        step_log.append({"step": step, "loss": float(loss.item()), "lr": lr_now})
 
-        if step % 100 == 0:
-            tok_s = (step + 1) * args.batch_size * args.seq_len / (time.time() - start)
-            print(f'step {step:5d} | loss {loss.item():.4f} | '
-                  f'ppl {math.exp(min(loss.item(), 20)):8.2f} | '
-                  f'lr {lr_now:.6f} | {tok_s:.0f} tok/s')
+        if is_main and step % 100 == 0:
+            tok_s = (step + 1) * args.batch_size * args.seq_len * world_size / (time.time() - start)
+            print(f"step {step:7d} | loss {loss.item():.4f} | "
+                  f"ppl {math.exp(min(loss.item(), 20)):8.2f} | "
+                  f"lr {lr_now:.6f} | {tok_s:.0f} tok/s")
 
-        # Spectral capture
-        if step > 0 and step % args.log_spectra_every == 0:
+        if is_main and step > 0 and step % args.log_spectra_every == 0:
             rec = log_capture(model, role_params, dl, args.spectra_batches, device, step)
             capture_log.append(rec)
-            n_qko = len(rec['roles'].get('qko', []))
-            n_v = len(rec['roles'].get('v', []))
-            n_ffn = len(rec['roles'].get('ffn', []))
-            print(f'  [capture step {step}] svd counts: '
-                  f'qko={n_qko} v={n_v} ffn={n_ffn}')
+            print(f"  [capture step {step}] roles: "
+                  f"qko={len(rec['roles'].get('qko', []))} "
+                  f"v={len(rec['roles'].get('v', []))} "
+                  f"ffn={len(rec['roles'].get('ffn', []))}")
 
-        # Eval
         if step > 0 and step % args.eval_every == 0:
             val = evaluate(model, dl, device)
-            val['step'] = step
-            val_log.append(val)
-            print(f'  EVAL step {step}: val_loss={val["val_loss"]:.4f} '
-                  f'ppl={val.get("val_ppl", float("nan")):.2f}')
+            if is_main:
+                val["step"] = step
+                val_log.append(val)
+                print(f"  EVAL step {step}: val_loss={val['val_loss']:.4f}")
 
-    # Final
     final = evaluate(model, dl, device)
-    final['step'] = args.steps
-    val_log.append(final)
-    qbuf_post = verify_qbuf(optimizers, target, role_by_optid)
+    if is_main:
+        final["step"] = args.steps
+        val_log.append(final)
 
-    tag = f'{args.profile}_seed{args.seed}_lr{args.lr}'
-    out = os.path.join(args.output_dir, tag)
-    os.makedirs(out, exist_ok=True)
+    qbuf_post = verify_qbuf(optimizers, target)
 
-    result = {
-        'tag': tag,
-        'profile': args.profile,
-        'target_ranks': target,
-        'budget_per_layer': b_actual,
-        'budget_struct_per_layer': b_struct,
-        'budget_ratio_vs_struct': b_actual / b_struct,
-        'arch': {'d': d, 'd_h': d_h, 'ffn_hidden': ffn_hidden,
-                 'max_rank': max_rank, 'n_layers': 18},
-        'lr': args.lr,
-        'seed': args.seed,
-        'steps': args.steps,
-        'batch_size': args.batch_size,
-        'seq_len': args.seq_len,
-        'final_val_loss': final['val_loss'],
-        'final_val_ppl': final.get('val_ppl', float('nan')),
-        'time_s': time.time() - start,
-        'qbuf_pre_ok': len(qbuf_pre['ok']),
-        'qbuf_pre_mismatches': len(qbuf_pre['mismatches']),
-        'qbuf_post_ok': len(qbuf_post['ok']),
-        'qbuf_post_mismatches': len(qbuf_post['mismatches']),
-    }
-    json.dump(result, open(os.path.join(out, 'result.json'), 'w'), indent=2)
-    json.dump(step_log, open(os.path.join(out, 'step_log.json'), 'w'))
-    json.dump(val_log, open(os.path.join(out, 'val_log.json'), 'w'))
-    json.dump(capture_log, open(os.path.join(out, 'capture_log.json'), 'w'))
-    json.dump(qbuf_pre, open(os.path.join(out, 'qbuf_pre.json'), 'w'), indent=2)
-    json.dump(qbuf_post, open(os.path.join(out, 'qbuf_post.json'), 'w'), indent=2)
-    print(f'\n[done] tag={tag} final_val_loss={final["val_loss"]:.4f}')
+    if is_main:
+        tag = f"{args.scale}_{args.profile}_seed{args.seed}_lr{args.lr}"
+        out = os.path.join(args.output_dir, tag)
+        os.makedirs(out, exist_ok=True)
+        result = {
+            "tag": tag,
+            "scale": args.scale, "profile": args.profile,
+            "target_ranks": target,
+            "budget_per_layer": b_actual, "budget_struct_per_layer": b_struct,
+            "budget_ratio_vs_struct": b_actual / b_struct,
+            "arch": {"d": d, "d_h": d_h, "ffn_hidden": ffn_hidden,
+                     "n_layers": n_layers, "max_rank": max_rank},
+            "world_size": world_size, "lr": args.lr, "seed": args.seed,
+            "steps": args.steps,
+            "batch_size": args.batch_size, "seq_len": args.seq_len,
+            "final_val_loss": final["val_loss"],
+            "final_val_ppl": final.get("val_ppl", float("nan")),
+            "time_s": time.time() - start,
+            "qbuf_pre_ok": len(qbuf_pre["ok"]),
+            "qbuf_pre_mismatches": len(qbuf_pre["mismatches"]),
+            "qbuf_post_ok": len(qbuf_post["ok"]),
+            "qbuf_post_mismatches": len(qbuf_post["mismatches"]),
+        }
+        json.dump(result, open(os.path.join(out, "result.json"), "w"), indent=2)
+        json.dump(step_log, open(os.path.join(out, "step_log.json"), "w"))
+        json.dump(val_log, open(os.path.join(out, "val_log.json"), "w"))
+        json.dump(capture_log, open(os.path.join(out, "capture_log.json"), "w"))
+        json.dump(qbuf_pre, open(os.path.join(out, "qbuf_pre.json"), "w"), indent=2)
+        json.dump(qbuf_post, open(os.path.join(out, "qbuf_post.json"), "w"), indent=2)
+        print(f"\n[done] tag={tag} final_val_loss={final['val_loss']:.4f}")
+
+    cleanup_distributed()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
