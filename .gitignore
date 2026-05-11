@@ -8,9 +8,6 @@ __pycache__/
 build/
 dist/
 
-# Cloned dependencies
-torchtitan/
-
 # Run outputs
 results/
 slurm_logs/

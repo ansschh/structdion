@@ -43,10 +43,10 @@ pip install --upgrade pip
 echo "[3/6] Installing torch + torchvision (cu121)"
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-echo "[4/6] Cloning + installing torchtitan (Pro-Place fork, Tatzhiro/replication)"
+echo "[4/6] Installing torchtitan (bundled in repo, no clone needed)"
 if [[ ! -d torchtitan ]]; then
-    git clone --branch Tatzhiro/replication --depth 1 \
-        https://github.com/Pro-Place/torchtitan.git
+    echo "[error] torchtitan/ directory not found in repo. Did you clone the right branch?"
+    exit 1
 fi
 pip install -e torchtitan
 
