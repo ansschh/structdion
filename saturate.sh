@@ -80,7 +80,7 @@ submit_scale() {
         echo ""
         echo "cd \"$REPO_DIR\""
         echo "source venv/bin/activate"
-        echo "export C4_CACHE=\"$REPO_DIR/data/c4_tokens.pt\""
+        echo "source env_setup.sh"
         echo "echo \"--- GPU(s) allocated for $scale profile=\$PROFILE seed=\$SEED ---\""
         echo "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
         echo ""

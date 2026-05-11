@@ -61,6 +61,10 @@ else
 fi
 # shellcheck disable=SC1091
 source venv/bin/activate
+# Redirect caches to scratch BEFORE any install (home is small).
+if [[ -f env_setup.sh ]]; then
+    source env_setup.sh
+fi
 pip install --upgrade pip >/dev/null
 
 # --------------------------------------------------------------------

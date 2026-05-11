@@ -33,7 +33,7 @@ cmd=(srun
         set -e
         cd '$REPO_DIR'
         source venv/bin/activate
-        export C4_CACHE='$REPO_DIR/data/c4_tokens.pt'
+        source env_setup.sh
         echo '--- GPU allocated ---'
         nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
         GPU_NAME=\$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -1)
