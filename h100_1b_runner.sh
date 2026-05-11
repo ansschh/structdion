@@ -36,6 +36,6 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 python -u torchtitan_polar/structural_law_entry.py \
     --profile "$PROFILE" --scale 1b --seed "$SEED" \
-    --steps 500000 --lr 0.012 \
+    --steps 730000 --lr 0.012 --dtype bf16 \
     --output_dir results/struct_law_full \
     --log_spectra_every 2000 --eval_every 1000

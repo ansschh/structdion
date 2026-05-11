@@ -43,8 +43,17 @@ from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
 import dion.dion as dd  # noqa: F401
+from dion import Dion
 
-from torchtitan.experiments.ortho_matrix.ada_dion.adadion import AdaDion
+# Optional Muon and Dion2 imports (only needed for those profiles).
+try:
+    from dion import Muon
+except Exception:
+    Muon = None  # type: ignore
+try:
+    from dion import Dion2
+except Exception:
+    Dion2 = None  # type: ignore
 
 # Make sibling imports work.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -52,12 +61,6 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 from models import build_model, scale_dims, Block, SCALE_SPECS  # noqa: E402
 from train_320m import get_c4_dataloader, get_lr, evaluate  # noqa: E402
-
-# Optional Muon import (only needed if --profile muon).
-try:
-    from dion import Muon
-except Exception:  # pragma: no cover - exercised only at --profile muon time
-    Muon = None  # type: ignore
 
 
 # =============================================================================
@@ -180,10 +183,11 @@ def log_capture(model, role_params: dict, dl, n_batches: int, device: str, step:
 # =============================================================================
 
 def verify_qbuf(optimizers: list, requested_rank: dict) -> dict:
+    """Walk optimizer states and confirm deployed rank matches requested.
+    Supports both AdaDion (state['Qbuf'], state['r']) and pure Dion
+    (state['Q'], inferred rank from shape). Adam / Muon are skipped."""
     out = {"mismatches": [], "ok": []}
     for opt in optimizers:
-        if not isinstance(opt, AdaDion):
-            continue
         for group in opt.param_groups:
             if group.get("algorithm") == "adamw":
                 continue
@@ -191,18 +195,18 @@ def verify_qbuf(optimizers: list, requested_rank: dict) -> dict:
             req = requested_rank.get(role) if role else None
             for p in group["params"]:
                 state = opt.state.get(p, {})
-                Qbuf = state.get("Qbuf")
-                if Qbuf is None:
+                buf = state.get("Qbuf", state.get("Q"))
+                if buf is None or not isinstance(buf, Tensor):
                     continue
                 q_rank = state.get("r")
-                if q_rank is None and isinstance(Qbuf, Tensor):
-                    q_rank = Qbuf.shape[-1]
+                if q_rank is None:
+                    q_rank = buf.shape[-1]
                 rec = {
                     "role": role, "requested": req,
-                    "deployed": int(q_rank) if q_rank is not None else None,
-                    "qbuf_shape": list(Qbuf.shape) if isinstance(Qbuf, Tensor) else None,
+                    "deployed": int(q_rank),
+                    "qbuf_shape": list(buf.shape),
                 }
-                if rec["deployed"] is None or req is None:
+                if req is None:
                     continue
                 if rec["deployed"] != req:
                     out["mismatches"].append(rec)
@@ -215,87 +219,92 @@ def verify_qbuf(optimizers: list, requested_rank: dict) -> dict:
 # Optimizer construction
 # =============================================================================
 
-def build_adadion_groups(
-    role_params: dict, target: dict, lr: float, max_rank: int
-) -> Tuple[list, List[Tensor]]:
-    """Return (param_groups, scalar_params)."""
-    param_groups = []
-    for role in ("qko", "v", "ffn"):
-        if not role_params[role]:
-            continue
-        params = [p for _, p in role_params[role]]
-        r = target[role]
-        param_groups.append({
-            "params": params, "role": role,
-            "init_rank": r, "rank_min": r, "rank_max": r,
-            "rank_step_up": 0, "rank_step_down": 0,
-        })
-
-    scalar_params = []
+def _gather_scalars(role_params: dict) -> list:
+    """Collect embedding/other params into a deduplicated list."""
+    scalars = []
     seen = set()
     for role in ("embed", "other"):
         for _, p in role_params[role]:
             if id(p) not in seen:
-                scalar_params.append(p)
+                scalars.append(p)
                 seen.add(id(p))
-
-    if scalar_params:
-        param_groups.append({
-            "params": scalar_params, "algorithm": "adamw",
-            "lr": 0.012, "weight_decay": 0.1,
-            "betas": (0.95, 0.95), "eps": 1e-8,
-        })
-
-    return param_groups, scalar_params
+    return scalars
 
 
 def build_optimizers(
     profile: str, role_params: dict, target: dict, lr: float, max_rank: int,
     mesh=None,
 ) -> List[torch.optim.Optimizer]:
+    """Construct the right optimizer for each profile.
+
+    Spectral profiles (struct, uniform_comm, inverted_matched) use pure
+    microsoft/dion's Dion with per-group rank_fraction. The dion2 profile
+    uses dion.Dion2. Muon uses dion.Muon (full-rank Newton-Schulz).
+    AdamW uses torch.optim.AdamW on every parameter.
+    """
+    scalars = _gather_scalars(role_params)
+
     if profile == "adamw":
-        all_matrix = []
-        for role in ("qko", "v", "ffn"):
-            all_matrix.extend(p for _, p in role_params[role])
-        scalars = []
-        for role in ("embed", "other"):
-            scalars.extend(p for _, p in role_params[role])
-        params = [p for p in all_matrix + scalars]
-        seen, dedup = set(), []
-        for p in params:
+        all_matrix = [p for role in ("qko", "v", "ffn")
+                      for _, p in role_params[role]]
+        dedup, seen = [], set()
+        for p in all_matrix + scalars:
             if id(p) not in seen:
-                dedup.append(p); seen.add(id(p))
+                dedup.append(p)
+                seen.add(id(p))
         return [torch.optim.AdamW(
             dedup, lr=lr, weight_decay=0.1, betas=(0.9, 0.95), eps=1e-8,
         )]
 
     if profile == "muon":
         if Muon is None:
-            raise RuntimeError("dion.Muon not importable; cannot use --profile muon")
-        all_matrix = [p for role in ("qko", "v", "ffn") for _, p in role_params[role]]
-        scalars = []
-        seen = set()
-        for role in ("embed", "other"):
-            for _, p in role_params[role]:
-                if id(p) not in seen:
-                    scalars.append(p); seen.add(id(p))
+            raise RuntimeError("dion.Muon not importable")
+        all_matrix = [p for role in ("qko", "v", "ffn")
+                      for _, p in role_params[role]]
         groups = [{"params": all_matrix}]
         if scalars:
-            groups.append({"params": scalars, "algorithm": "adamw", "lr": 0.012})
-        return [Muon(groups, lr=lr, flatten=True)]
+            groups.append({"params": scalars, "algorithm": "adamw",
+                           "lr": 0.012, "weight_decay": 0.1})
+        return [Muon(groups, lr=lr, weight_decay=0.1, flatten=True)]
 
-    # Spectral profiles (struct, uniform_comm, inverted_matched): use AdaDion.
-    param_groups, _ = build_adadion_groups(role_params, target, lr, max_rank)
-    opt = AdaDion(
-        param_groups,
-        lr=lr,
-        weight_decay=0.1,
-        init_rank=target.get("qko", 64),
-        rank_min=16,
-        rank_max=max_rank,
-        device_mesh=mesh,
-    )
-    return [opt]
+    if profile == "dion2":
+        if Dion2 is None:
+            raise RuntimeError("dion.Dion2 not importable")
+        groups = []
+        for role in ("qko", "v", "ffn"):
+            if not role_params[role]:
+                continue
+            params = [p for _, p in role_params[role]]
+            rf = target[role] / max_rank
+            groups.append({"params": params, "role": role,
+                           "fraction": rf})
+        if scalars:
+            groups.append({"params": scalars, "algorithm": "adamw",
+                           "lr": 0.012, "weight_decay": 0.1})
+        return [Dion2(
+            groups, lr=lr, weight_decay=0.1, flatten=True,
+            outer_shard_mesh=mesh,
+        )]
+
+    # Spectral profiles: struct, uniform_comm, inverted_matched -> pure Dion
+    groups = []
+    for role in ("qko", "v", "ffn"):
+        if not role_params[role]:
+            continue
+        params = [p for _, p in role_params[role]]
+        rf = target[role] / max_rank
+        groups.append({"params": params, "role": role,
+                       "rank_fraction": rf})
+    if scalars:
+        groups.append({"params": scalars, "algorithm": "adamw",
+                       "lr": 0.012, "weight_decay": 0.1,
+                       "betas": (0.95, 0.95), "eps": 1e-8})
+
+    return [Dion(
+        groups, lr=lr, weight_decay=0.1,
+        rank_fraction=target.get("qko", 64) / max_rank,
+        outer_shard_mesh=mesh,
+    )]
 
 
 # =============================================================================
@@ -324,7 +333,10 @@ def cleanup_distributed():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", required=True,
-                    choices=["struct", "uniform_comm", "inverted_matched", "adamw", "muon"])
+                    choices=["struct", "uniform_comm", "inverted_matched",
+                             "adamw", "muon", "dion2"])
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"],
+                    help="autocast dtype; bf16 is ~2-4x faster on H100/H200")
     ap.add_argument("--scale", default="340m", choices=list(SCALE_SPECS.keys()))
     ap.add_argument("--steps", type=int, default=None,
                     help="if unset, use T/P schedule: 340M=830000, 700M=1300000, 1B=750000")
@@ -444,8 +456,11 @@ def main():
             for g in opt.param_groups:
                 g["lr"] = lr_now
 
-        logits = model(x)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        autocast_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype,
+                            enabled=(args.dtype != "fp32")):
+            logits = model(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         for opt in optimizers:

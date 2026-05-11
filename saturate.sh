@@ -29,18 +29,13 @@ PROFILES=(uniform_comm struct inverted_matched adamw muon)
 SCALES_STR="${SCALES:-340m 700m 1b}"
 read -r -a SCALES <<< "$SCALES_STR"
 
-# Per-scale resource plan
-# scale -> (gpus_per_task, time_limit, default_steps)
-#
-# H200 single-GPU is fast enough that FSDP is not worth its complexity
-# at this scale (1B model + AdaDion state easily fits in 143 GB). We
-# therefore run every task on 1 GPU, picking T/P to fit the time budget.
-#   340M: T/P=10  -> 830k steps (~12h)
-#   700M: T/P=5   -> 860k steps (~18h)
-#   1B  : T/P=2   -> 500k steps (~19h, marked "preliminary")
-declare -A SCALE_GPUS=(  [340m]=1  [700m]=1  [1b]=1 )
-declare -A SCALE_TIME=(  [340m]=18:00:00 [700m]=24:00:00 [1b]=24:00:00 )
-declare -A SCALE_STEPS=( [340m]=830000   [700m]=860000   [1b]=500000   )
+# Per-scale resource plan (with bf16 autocast + pure Dion):
+#   340M:  1 GPU, T/P=10, ~6h
+#   700M:  1 GPU, T/P=5,  ~12 to 15h
+#   1B:    4 GPUs FSDP, T/P=2 to 3, ~3 to 5h
+declare -A SCALE_GPUS=(  [340m]=1         [700m]=1         [1b]=4 )
+declare -A SCALE_TIME=(  [340m]=12:00:00  [700m]=24:00:00  [1b]=12:00:00 )
+declare -A SCALE_STEPS=( [340m]=830000    [700m]=860000    [1b]=730000 )
 
 echo "============================================================"
 echo "StructDion full sweep"
@@ -102,6 +97,7 @@ submit_scale() {
         echo "    --seed \"\$SEED\" \\"
         echo "    --steps $steps \\"
         echo "    --lr 0.012 \\"
+        echo "    --dtype bf16 \\"
         echo "    --output_dir \"$RESULTS_DIR\" \\"
         echo "    --log_spectra_every 2000 \\"
         echo "    --eval_every 1000"
