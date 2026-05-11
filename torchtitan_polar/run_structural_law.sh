@@ -1,48 +1,58 @@
 #!/usr/bin/env bash
-# Structural rank-allocation experiment driver for the HiLD 2026 paper.
-#
-# Runs three profiles (struct, uniform_comm, inverted) at three seeds each
-# on LLaMA320M. With 3.4B tokens per run (T/P = 10) this should fit comfortably
-# in a 1-day window on 50 sustained H100s.
+# Sequential driver: run a fixed list of (scale, profile, seed) cells.
+# Honored env vars:
+#   STEPS              steps per run (default: 500 for smoke)
+#   LOG_SPECTRA_EVERY  default 100
+#   EVAL_EVERY         default 100
+#   BATCH_SIZE         default 4
+#   SEQ_LEN            default 1024
+#   LR                 default 0.012
+#   SCALE              default 340m
+#   PROFILES           default "uniform_comm struct inverted_matched"
+#   SEEDS              default "0 1 2"
+#   NPROC              default 1; if >1 we use torchrun
 #
 # Usage:
 #   bash run_structural_law.sh [results_root]
-#
-# Defaults to results/struct_law if not given.
 
 set -euo pipefail
 
 RESULTS_ROOT="${1:-results/struct_law}"
 mkdir -p "$RESULTS_ROOT"
 
-PROFILES=(uniform_comm struct inverted)
-SEEDS=(0 1 2)
+PROFILES_STR="${PROFILES:-uniform_comm struct inverted_matched}"
+SEEDS_STR="${SEEDS:-0 1 2}"
+SCALE="${SCALE:-340m}"
 
-# 3.4B tokens at batch_size=4, seq_len=1024 needs ~830k steps.
-# We use the established AdaDion 320M settings: bs=4, seq=1024.
-# Override STEPS via env if you want a smoke (e.g. STEPS=500).
-STEPS="${STEPS:-830000}"
+STEPS="${STEPS:-500}"
+LOG_SPECTRA_EVERY="${LOG_SPECTRA_EVERY:-100}"
+EVAL_EVERY="${EVAL_EVERY:-100}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 SEQ_LEN="${SEQ_LEN:-1024}"
 LR="${LR:-0.012}"
-LOG_SPECTRA_EVERY="${LOG_SPECTRA_EVERY:-2000}"
-EVAL_EVERY="${EVAL_EVERY:-1000}"
+NPROC="${NPROC:-1}"
+
+REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+export C4_CACHE="${C4_CACHE:-$REPO_DIR/data/c4_tokens.pt}"
+
+read -r -a PROFILES <<< "$PROFILES_STR"
+read -r -a SEEDS <<< "$SEEDS_STR"
 
 echo "================================================================="
-echo "Structural law experiments"
+echo "Structural law sequential driver"
 echo "  results root        : $RESULTS_ROOT"
-echo "  steps               : $STEPS  (override with STEPS=N)"
-echo "  batch_size, seq_len : $BATCH_SIZE, $SEQ_LEN"
-echo "  lr                  : $LR"
-echo "  spectra logged every: $LOG_SPECTRA_EVERY"
-echo "  eval every          : $EVAL_EVERY"
+echo "  scale               : $SCALE"
 echo "  profiles            : ${PROFILES[*]}"
 echo "  seeds               : ${SEEDS[*]}"
+echo "  steps               : $STEPS"
+echo "  nproc per run       : $NPROC"
 echo "================================================================="
+
+cd "$REPO_DIR"
 
 for PROFILE in "${PROFILES[@]}"; do
     for SEED in "${SEEDS[@]}"; do
-        TAG="${PROFILE}_seed${SEED}_lr${LR}"
+        TAG="${SCALE}_${PROFILE}_seed${SEED}_lr${LR}"
         OUT="$RESULTS_ROOT/$TAG"
         if [[ -f "$OUT/result.json" ]]; then
             echo "[skip] $TAG already has result.json"
@@ -50,24 +60,39 @@ for PROFILE in "${PROFILES[@]}"; do
         fi
         echo
         echo "================================================================="
-        echo "LAUNCH: profile=$PROFILE seed=$SEED"
+        echo "LAUNCH: scale=$SCALE profile=$PROFILE seed=$SEED nproc=$NPROC"
         echo "================================================================="
-        python -u structural_law_entry.py \
-            --profile "$PROFILE" \
-            --seed "$SEED" \
-            --lr "$LR" \
-            --steps "$STEPS" \
-            --batch_size "$BATCH_SIZE" \
-            --seq_len "$SEQ_LEN" \
-            --output_dir "$RESULTS_ROOT" \
-            --log_spectra_every "$LOG_SPECTRA_EVERY" \
-            --eval_every "$EVAL_EVERY" \
-            2>&1 | tee -a "$RESULTS_ROOT/${TAG}.log"
+        if [[ "$NPROC" -gt 1 ]]; then
+            torchrun --standalone --nproc_per_node="$NPROC" \
+                torchtitan_polar/structural_law_entry.py \
+                --profile "$PROFILE" \
+                --scale "$SCALE" \
+                --seed "$SEED" \
+                --lr "$LR" \
+                --steps "$STEPS" \
+                --batch_size "$BATCH_SIZE" \
+                --seq_len "$SEQ_LEN" \
+                --output_dir "$RESULTS_ROOT" \
+                --log_spectra_every "$LOG_SPECTRA_EVERY" \
+                --eval_every "$EVAL_EVERY"
+        else
+            python -u torchtitan_polar/structural_law_entry.py \
+                --profile "$PROFILE" \
+                --scale "$SCALE" \
+                --seed "$SEED" \
+                --lr "$LR" \
+                --steps "$STEPS" \
+                --batch_size "$BATCH_SIZE" \
+                --seq_len "$SEQ_LEN" \
+                --output_dir "$RESULTS_ROOT" \
+                --log_spectra_every "$LOG_SPECTRA_EVERY" \
+                --eval_every "$EVAL_EVERY"
+        fi
     done
 done
 
 echo
 echo "================================================================="
-echo "All runs complete."
-echo "Aggregate with: python aggregate_structural.py $RESULTS_ROOT"
+echo "Driver complete. Aggregate with:"
+echo "  python torchtitan_polar/aggregate_structural.py $RESULTS_ROOT"
 echo "================================================================="
