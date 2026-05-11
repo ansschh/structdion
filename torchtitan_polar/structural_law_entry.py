@@ -164,14 +164,17 @@ def log_capture(model, role_params: dict, dl, n_batches: int, device: str, step:
 
 def verify_qbuf(optimizers: list, requested_rank: dict, role_by_optid: dict) -> dict:
     """Read each optimizer's internal Q buffers and confirm that the
-    deployed rank matches the requested rank. Returns mismatches."""
+    deployed rank matches the requested rank for the param's role.
+    Returns mismatches."""
     out = {'mismatches': [], 'ok': []}
     for opt in optimizers:
         if not isinstance(opt, AdaDion):
             continue
-        role = role_by_optid.get(id(opt))
-        req = requested_rank.get(role)
         for group in opt.param_groups:
+            if group.get('algorithm') == 'adamw':
+                continue
+            role = group.get('role', None)
+            req = requested_rank.get(role) if role else None
             for p in group['params']:
                 state = opt.state.get(p, {})
                 Q = state.get('Q', None)
@@ -246,29 +249,30 @@ def main():
     for role in ('qko', 'v', 'ffn', 'embed', 'other'):
         print(f'[role {role:6s}] {len(role_params[role])} params')
 
-    # Build optimizers: one AdaDion per matrix role, AdamW for the rest
-    optimizers = []
-    role_by_optid = {}
+    # Build ONE AdaDion with per-role param-groups. The bundled AdaDion reads
+    # `init_rank`, `rank_min`, `rank_max` from each group; setting them all to
+    # the same target value locks the rank.
+    param_groups = []
+    role_by_group_idx = {}
     for role in ('qko', 'v', 'ffn'):
         if not role_params[role]:
             continue
         params = [p for _, p in role_params[role]]
         target_rank = target[role]
-        rank_fraction = target_rank / max_rank
-        opt = AdaDion(
-            [{'params': params}],
-            lr=args.lr, weight_decay=0.1,
-            rank_fraction_max=rank_fraction,
-            adaptive_rank=False,
-            init_rank_fraction=rank_fraction,
-            erank_ema_beta=0.5, rank_scale=2.0, rank_min=16, rank_quantize=8,
-        )
-        optimizers.append(opt)
-        role_by_optid[id(opt)] = role
-        print(f'[opt {role}] AdaDion rank_fraction={rank_fraction:.4f} '
-              f'(target_rank={target_rank}, max_rank={max_rank})')
+        param_groups.append({
+            'params': params,
+            'role': role,
+            'init_rank': target_rank,
+            'rank_min': target_rank,
+            'rank_max': target_rank,
+            'rank_step_up': 0,
+            'rank_step_down': 0,
+        })
+        role_by_group_idx[len(param_groups) - 1] = role
+        print(f'[group {role:4s}] target_rank={target_rank} '
+              f'(n_params={len(params)})')
 
-    # AdamW group: embed/other and all non-2D params
+    # AdamW group for scalars and embeddings
     scalar_params = []
     seen = set()
     for role in ('embed', 'other'):
@@ -277,12 +281,28 @@ def main():
                 scalar_params.append(p)
                 seen.add(id(p))
     if scalar_params:
-        adam = torch.optim.AdamW(
-            scalar_params, lr=0.012, weight_decay=0.1,
-            betas=(0.95, 0.95), eps=1e-8,
-        )
-        optimizers.append(adam)
-        print(f'[opt adam] AdamW on {len(scalar_params)} scalar/embed params')
+        param_groups.append({
+            'params': scalar_params,
+            'algorithm': 'adamw',
+            'lr': 0.012,
+            'weight_decay': 0.1,
+            'betas': (0.95, 0.95),
+            'eps': 1e-8,
+        })
+        print(f'[group adam] n_params={len(scalar_params)}')
+
+    opt = AdaDion(
+        param_groups,
+        lr=args.lr,
+        weight_decay=0.1,
+        # bundled AdaDion takes integer init_rank as a global default; the
+        # per-group values above override this for each role group.
+        init_rank=target['qko'],
+        rank_min=16,
+        rank_max=max_rank,
+    )
+    optimizers = [opt]
+    role_by_optid = {id(opt): 'multi-group'}
 
     # Data
     dl = get_c4_dataloader(batch_size=args.batch_size, seq_len=args.seq_len)
