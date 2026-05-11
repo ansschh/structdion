@@ -30,7 +30,14 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
 
 from torchtitan.experiments.ortho_matrix.ada_dion.adadion import AdaDion
-from torchtitan.experiments.ortho_matrix.ada_dion.polar_adadion import PolarAdaDion
+
+# PolarAdaDion is only used by the legacy create_optimizer helper in this
+# file; the structural-law launcher does not need it. Make the import
+# optional so the module loads in environments that bundle only AdaDion.
+try:
+    from torchtitan.experiments.ortho_matrix.ada_dion.polar_adadion import PolarAdaDion
+except ModuleNotFoundError:
+    PolarAdaDion = None  # type: ignore
 
 
 # =========================================================================
