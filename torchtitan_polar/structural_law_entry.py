@@ -32,7 +32,16 @@ from torch import Tensor
 import dion.dion as dd  # noqa: F401  (kept in case other patches are needed later)
 
 from torchtitan.experiments.ortho_matrix.ada_dion.adadion import AdaDion
-from torchtitan.experiments.ortho_matrix.ada_dion.train_320m import (
+
+# LLaMA320M, get_c4_dataloader, get_lr, evaluate live in the sibling
+# train_320m.py inside this directory (not in the installed torchtitan
+# package). Add the script directory to sys.path so we can import it.
+import os as _os
+import sys as _sys
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+from train_320m import (  # noqa: E402
     LLaMA320M, get_c4_dataloader, get_lr, evaluate,
 )
 

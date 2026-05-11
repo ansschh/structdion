@@ -113,12 +113,14 @@ echo "    + utility deps"
 pip install datasets tokenizers safetensors tqdm matplotlib numpy
 
 echo "[6/6] Verifying imports"
-python - <<'PY'
+python - <<PY
+import sys, os
+sys.path.insert(0, os.path.join("$REPO_DIR", "torchtitan_polar"))
 import torch
 print(f"  torch        {torch.__version__}  cuda_available={torch.cuda.is_available()}")
 from torchtitan.experiments.ortho_matrix.ada_dion.adadion import AdaDion
 print("  AdaDion       OK")
-from torchtitan.experiments.ortho_matrix.ada_dion.train_320m import LLaMA320M, get_c4_dataloader, get_lr, evaluate
+from train_320m import LLaMA320M, get_c4_dataloader, get_lr, evaluate
 print("  train_320m    OK (LLaMA320M, get_c4_dataloader, get_lr, evaluate)")
 import dion.dion as dd
 print("  dion.dion     OK")
