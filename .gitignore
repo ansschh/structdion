@@ -1,0 +1,25 @@
+# venv and build artifacts
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Cloned dependencies
+torchtitan/
+
+# Run outputs
+results/
+slurm_logs/
+*.log
+*.out
+*.err
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
