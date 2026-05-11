@@ -118,9 +118,9 @@ fi
 # --------------------------------------------------------------------
 # Step 4: utility deps
 # --------------------------------------------------------------------
-if ! check_import "import datasets, tokenizers, safetensors, matplotlib, numpy, tqdm"; then
+if ! check_import "import datasets, tokenizers, transformers, safetensors, matplotlib, numpy, tqdm"; then
     echo "[install] utility deps"
-    pip install datasets tokenizers safetensors tqdm matplotlib numpy
+    pip install datasets tokenizers transformers safetensors tqdm matplotlib numpy
 else
     echo "[skip] utility deps already installed"
 fi
@@ -150,7 +150,8 @@ echo "For future shells:"
 echo "  module load $PY_MODULE"
 echo "  source $REPO_DIR/venv/bin/activate"
 echo
-echo "Next (request an A100 or H100, NOT a P100):"
-echo "  GRES=gpu:a100:1 bash smoke.sh"
-echo "  GRES=gpu:a100:1 bash full.sh"
+echo "Next, IN ORDER:"
+echo "  1) bash prepare_data.sh                                # tokenize C4 once on the login node"
+echo "  2) GRES=gpu:nvidia_h200:1 PARTITION=beta bash smoke.sh # 500-step smoke on H200"
+echo "  3) GRES=gpu:nvidia_h200:1 PARTITION=beta bash full.sh  # full 3-profile x 3-seed sweep"
 echo "============================================================"

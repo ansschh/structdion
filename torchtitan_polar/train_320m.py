@@ -150,17 +150,29 @@ class LLaMA320M(nn.Module):
 # =========================================================================
 
 def get_c4_dataloader(batch_size=32, seq_len=2048, num_workers=2):
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
+    # Cache path can be overridden by C4_CACHE env var so the compute node
+    # never has to hit the network. Default falls back to <repo_root>/data
+    # which prepare_data.sh populates on the login node.
+    cache_path = os.environ.get("C4_CACHE")
+    if cache_path is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(here, ".."))
+        cache_path = os.path.join(repo_root, "data", "c4_tokens.pt")
 
-    tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    cache_path = "/workspace/data/c4_tokens.pt"
     if os.path.exists(cache_path):
         tokens = torch.load(cache_path, weights_only=True)
     else:
+        # On-the-fly tokenization. Requires `transformers` and `datasets`
+        # AND network access on the current node. The supported workflow
+        # is to call `bash prepare_data.sh` on the login node ONCE; the
+        # GPU job then reads from the cached file with no network usage.
+        from datasets import load_dataset
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("gpt2", use_fast=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
         ds = load_dataset("allenai/c4", "en", split="train", streaming=True)
         all_tokens = []
         for i, example in enumerate(ds):

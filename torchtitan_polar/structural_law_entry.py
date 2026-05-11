@@ -177,17 +177,21 @@ def verify_qbuf(optimizers: list, requested_rank: dict, role_by_optid: dict) -> 
             req = requested_rank.get(role) if role else None
             for p in group['params']:
                 state = opt.state.get(p, {})
-                Q = state.get('Q', None)
-                if Q is None:
+                # Bundled AdaDion stores the orthonormal buffer as 'Qbuf' and
+                # the current rank as 'r'. State is populated only after the
+                # first step, so the pre-train check may find nothing (which
+                # is fine: we just have zero rows in the "ok" list).
+                Qbuf = state.get('Qbuf', None)
+                if Qbuf is None:
                     continue
                 q_rank = state.get('r', None)
-                if q_rank is None and isinstance(Q, Tensor):
-                    q_rank = Q.shape[-1]
+                if q_rank is None and isinstance(Qbuf, Tensor):
+                    q_rank = Qbuf.shape[-1]
                 rec = {
                     'role': role,
                     'requested': req,
                     'deployed': int(q_rank) if q_rank is not None else None,
-                    'qbuf_shape': list(Q.shape) if isinstance(Q, Tensor) else None,
+                    'qbuf_shape': list(Qbuf.shape) if isinstance(Qbuf, Tensor) else None,
                 }
                 if rec['deployed'] is None or req is None:
                     continue
