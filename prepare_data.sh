@@ -31,6 +31,15 @@ fi
 # shellcheck disable=SC1091
 source venv/bin/activate
 
+# Caltech compute/login nodes don't ship a CA bundle that recognises
+# huggingface.co's certificate chain. Point httpx / requests / urllib at
+# certifi's bundle (always present after pip-installing certifi).
+CERTIFI_PATH="$(python -c 'import certifi; print(certifi.where())')"
+export SSL_CERT_FILE="$CERTIFI_PATH"
+export REQUESTS_CA_BUNDLE="$CERTIFI_PATH"
+export CURL_CA_BUNDLE="$CERTIFI_PATH"
+echo "[ssl] using CA bundle: $CERTIFI_PATH"
+
 echo "[step] downloading + tokenizing C4 (this takes ~3 to 10 minutes)"
 mkdir -p "$REPO_DIR/data"
 python - <<PY
