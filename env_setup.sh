@@ -34,5 +34,9 @@ fi
 # C4 token cache (used by train_320m.get_c4_dataloader)
 export C4_CACHE="${C4_CACHE:-$REPO_DIR/data/c4_tokens.pt}"
 
+# Make torch.compile fall back to eager when its guard check fails
+# (seen with dion's orthogonalize on Lean torch + triton).
+export TORCHDYNAMO_SUPPRESS_ERRORS="${TORCHDYNAMO_SUPPRESS_ERRORS:-1}"
+
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR" "$TORCH_HOME" \
          "$HF_HOME" "$PIP_CACHE_DIR" 2>/dev/null || true

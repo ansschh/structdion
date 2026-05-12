@@ -42,6 +42,16 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy, MixedPrecision
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
+import torch._dynamo
+# dion uses @torch.compile inside orthogonalize/Newton-Schulz. On some
+# torch + triton + driver combos the guard check raises
+# "OpaqueUnaryFn_sqrt is not defined". Suppress and fall back to eager.
+torch._dynamo.config.suppress_errors = True
+try:
+    torch._dynamo.config.cache_size_limit = 64
+except Exception:
+    pass
+
 import dion.dion as dd  # noqa: F401
 from dion import Dion
 
