@@ -29,13 +29,20 @@ PROFILES=(uniform_comm struct inverted_matched adamw muon)
 SCALES_STR="${SCALES:-340m 700m 1b}"
 read -r -a SCALES <<< "$SCALES_STR"
 
-# Per-scale resource plan (with bf16 autocast + pure Dion):
-#   340M:  1 GPU, T/P=10, ~6h
-#   700M:  1 GPU, T/P=5,  ~12 to 15h
-#   1B:    4 GPUs FSDP, T/P=2 to 3, ~3 to 5h
-declare -A SCALE_GPUS=(  [340m]=1         [700m]=1         [1b]=4 )
-declare -A SCALE_TIME=(  [340m]=12:00:00  [700m]=24:00:00  [1b]=12:00:00 )
-declare -A SCALE_STEPS=( [340m]=830000    [700m]=860000    [1b]=730000 )
+# Per-scale resource plan. With FAST=1 (default for the 6-hour deadline mode):
+#   340M:  1 GPU,         T/P ~2.4,  200k steps, ~4h
+#   700M:  4 GPUs FSDP,   T/P ~1.1,  200k steps, ~4h
+#   1B:    4 GPUs FSDP,   T/P ~0.8,  200k steps, ~5 to 6h
+# With FAST=0 you get the full T/P=10 / T/P=5 / T/P=3 budget instead.
+if [[ "${FAST:-1}" == "1" ]]; then
+    declare -A SCALE_GPUS=(  [340m]=1         [700m]=4         [1b]=4 )
+    declare -A SCALE_TIME=(  [340m]=06:00:00  [700m]=06:00:00  [1b]=06:30:00 )
+    declare -A SCALE_STEPS=( [340m]=200000    [700m]=200000    [1b]=200000 )
+else
+    declare -A SCALE_GPUS=(  [340m]=1         [700m]=1         [1b]=4 )
+    declare -A SCALE_TIME=(  [340m]=12:00:00  [700m]=24:00:00  [1b]=12:00:00 )
+    declare -A SCALE_STEPS=( [340m]=830000    [700m]=860000    [1b]=730000 )
+fi
 
 echo "============================================================"
 echo "StructDion full sweep"
