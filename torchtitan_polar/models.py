@@ -144,9 +144,10 @@ class LLaMA(nn.Module):
 
 # (dim, n_layers, n_heads, hidden_dim, target param count for label)
 SCALE_SPECS = {
-    "340m": dict(dim=768,  n_layers=18, n_heads=12, hidden_dim=2048),  # ~320M
-    "700m": dict(dim=1536, n_layers=22, n_heads=24, hidden_dim=4096),  # ~700M
-    "1b":   dict(dim=2048, n_layers=18, n_heads=32, hidden_dim=5504),  # ~1.0B
+    "340m":       dict(dim=768,  n_layers=18, n_heads=12, hidden_dim=2048),  # ~320M, d_h=64
+    "340m_dh128": dict(dim=768,  n_layers=18, n_heads=6,  hidden_dim=2048),  # same params, d_h=128
+    "700m":       dict(dim=1536, n_layers=22, n_heads=24, hidden_dim=4096),  # ~700M, d_h=64
+    "1b":         dict(dim=2048, n_layers=18, n_heads=32, hidden_dim=5504),  # ~1.0B, d_h=64
 }
 
 
